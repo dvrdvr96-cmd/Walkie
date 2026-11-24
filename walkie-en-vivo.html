@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Walkie</title>
+<style>
+:root{--bg:#f4f4f1;--fg:#1c1c1a;--mut:#6b6b66;--card:#ffffff;--bd:#dcdcd6;--ac:#d9480f;--ok:#2b8a3e;--bad:#c92a2a;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#ececE8;--mut:#9b9b94;--card:#222220;--bd:#34342f;--ac:#ff7a3d;--ok:#51cf66;--bad:#ff8787;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;min-height:100vh;padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}
+main{max-width:440px;margin:0 auto;padding:20px 16px 32px}
+h1{font-size:22px;margin:4px 0 16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:16px;margin-bottom:14px}
+label{display:block;font-size:13px;color:var(--mut);margin:10px 0 4px}
+input{width:100%;font:inherit;padding:10px 12px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--fg)}
+button.go{width:100%;margin-top:16px;padding:12px;font:inherit;font-weight:600;border:0;border-radius:12px;background:var(--ac);color:#fff}
+.bar{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:14px;color:var(--mut)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--bad);margin-right:6px}
+.dot.on{background:var(--ok)}
+#ptt{display:block;width:230px;height:230px;margin:28px auto 14px;border-radius:50%;border:6px solid var(--bd);background:var(--card);color:var(--fg);font:inherit;font-size:18px;font-weight:700;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+#ptt.hot{background:var(--ac);border-color:var(--ac);color:#fff;transform:scale(.97)}
+#ptt:disabled{opacity:.45}
+#st{text-align:center;min-height:44px;color:var(--mut);font-size:15px}
+.err{color:var(--bad)}
+.hide{display:none}
+small{color:var(--mut)}
+</style>
+</head>
+<body>
+<main>
+<h1>📻 Walkie</h1>
+
+<section id="login" class="card">
+  <label for="name">Tu nombre</label>
+  <input id="name" maxlength="24" autocomplete="off" placeholder="Ana">
+  <label for="chan">Código del canal (compártelo solo con tu equipo)</label>
+  <input id="chan" maxlength="40" autocomplete="off" value="equipo-1234">
+  <button class="go" id="enter">Entrar</button>
+  <p><small>Se te pedirá permiso para usar el micrófono. Funciona solo en https o abriendo el archivo en tu ordenador. Usa auriculares para evitar ecos.</small></p>
+</section>
+
+<section id="app" class="hide">
+  <div class="bar"><span><span class="dot" id="dot"></span>Canal <b id="cn"></b></span><span id="peers"></span></div>
+  <button id="ptt" disabled>Mantén pulsado<br>para hablar</button>
+  <div id="st"></div>
+</section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+(function(){
+var $=function(s){return document.querySelector(s)};
+var local=null,track=null,talking=false,timer=null,enableT=null,myName="Anónimo",base="",myId="",micMsg="";
+var peer=null,isHub=false,conns=[],up=null,retry=null,left=false,resetting=false;
+var calls={},audios={},speakers={},ctx=null;
+
+function say(t,bad){var e=$("#st");e.textContent=t||"";e.className=bad?"err":""}
+function dot(on){$("#dot").className="dot"+(on?" on":"")}
+function refresh(){
+  if(talking){say("Hablando…");return}
+  var now=Date.now(),names=Object.keys(speakers).filter(function(k){return now-speakers[k]<65000});
+  if(names.length)say(names.join(", ")+" hablando…");
+  else if(micMsg)say(micMsg,true);
+  else say("");
+}
+
+try{var s=JSON.parse(localStorage.getItem("walkie")||"{}");if(s.name)$("#name").value=s.name;if(s.c)$("#chan").value=s.c}catch(e){}
+
+/* ---------- sonidos de walkie ---------- */
+function tone(f1,f2,ms,vol){
+  if(!ctx)return;
+  var t=ctx.currentTime,o=ctx.createOscillator(),g=ctx.createGain();
+  o.type="square";o.frequency.setValueAtTime(f1,t);o.frequency.linearRampToValueAtTime(f2,t+ms/1000);
+  g.gain.setValueAtTime(vol||0.06,t);g.gain.exponentialRampToValueAtTime(0.0001,t+ms/1000);
+  o.connect(g);g.connect(ctx.destination);o.start(t);o.stop(t+ms/1000+0.02);
+}
+function squelch(){
+  if(!ctx)return;
+  var len=Math.floor(ctx.sampleRate*0.09),b=ctx.createBuffer(1,len,ctx.sampleRate),d=b.getChannelData(0);
+  for(var i=0;i<len;i++)d[i]=(Math.random()*2-1)*(1-i/len);
+  var src=ctx.createBufferSource(),g=ctx.createGain();
+  src.buffer=b;g.gain.value=0.05;src.connect(g);g.connect(ctx.destination);src.start();
+  tone(1000,650,80,0.04);
+}
+
+/* ---------- audio recibido ---------- */
+function attach(id,st){
+  var a=audios[id];
+  if(!a){a=document.createElement("audio");a.autoplay=true;a.setAttribute("playsinline","");document.body.appendChild(a);audios[id]=a}
+  a.srcObject=st;
+  var p=a.play();if(p&&p.catch)p.catch(function(){say("Toca la pantalla para activar el sonido",true)});
+}
+function drop(id){var a=audios[id];if(a){a.srcObject=null;a.remove();delete audios[id]}}
+
+/* ---------- llamadas de voz (WebRTC entre todos) ---------- */
+function watch(call){
+  var old=calls[call.peer];calls[call.peer]=call;
+  if(old&&old!==call){try{old.close()}catch(e){}}
+  call.on("stream",function(s){attach(call.peer,s)});
+  call.on("close",function(){if(calls[call.peer]===call){delete calls[call.peer];drop(call.peer)}});
+  call.on("error",function(){});
+}
+function onCall(call){call.answer(local);watch(call)}
+function applyRoster(ids){
+  $("#peers").textContent=ids.length+" conectados";
+  Object.keys(calls).forEach(function(id){
+    if(ids.indexOf(id)<0){try{calls[id].close()}catch(e){}delete calls[id];drop(id)}
+  });
+  ids.forEach(function(id){
+    if(id!==myId&&myId<id&&!calls[id]&&peer){watch(peer.call(id,local))}
+  });
+}
+
+/* ---------- señalización: un participante hace de centralita ---------- */
+function sendS(on){
+  var m={t:"s",w:myName,on:on};
+  if(isHub)conns.forEach(function(c){if(c.open)c.send(m)});
+  else if(up&&up.open)up.send(m);
+}
+function roster(){
+  if(!isHub)return;
+  var ids=[myId].concat(conns.filter(function(c){return c.open}).map(function(c){return c.peer}));
+  applyRoster(ids);
+  conns.forEach(function(c){if(c.open)c.send({t:"r",ids:ids})});
+}
+function onData(d,from){
+  if(!d||typeof d!=="object")return;
+  if(d.t==="r"&&!isHub&&Array.isArray(d.ids)){
+    applyRoster(d.ids.filter(function(x){return typeof x==="string"}).slice(0,30));return;
+  }
+  if(d.t==="s"){
+    var w=String(d.w||"Alguien").slice(0,24),on=!!d.on;
+    if(isHub)conns.forEach(function(c){if(c!==from&&c.open)c.send({t:"s",w:w,on:on})});
+    if(on){speakers[w]=Date.now();tone(900,1300,90)}else{delete speakers[w];squelch()}
+    refresh();
+  }
+}
+function reset(){
+  resetting=true;
+  clearTimeout(retry);
+  var p=peer;peer=null;up=null;isHub=false;conns=[];myId="";dot(false);
+  Object.keys(calls).forEach(function(id){try{calls[id].close()}catch(e){}});
+  calls={};Object.keys(audios).forEach(drop);
+  try{if(p)p.destroy()}catch(e){}
+  resetting=false;
+}
+function again(){
+  if(left||resetting)return;
+  reset();say("Reconectando…");
+  retry=setTimeout(connect,400+Math.random()*1600);
+}
+function connect(){
+  if(left)return;
+  reset();
+  var hub=new Peer(base+"-hub");
+  peer=hub;
+  hub.on("open",function(id){isHub=true;myId=id;dot(true);refresh();roster()});
+  hub.on("connection",function(c){
+    c.on("open",function(){conns.push(c);roster()});
+    c.on("data",function(d){onData(d,c)});
+    c.on("close",function(){conns=conns.filter(function(x){return x!==c});roster()});
+    c.on("error",function(){});
+  });
+  hub.on("call",onCall);
+  hub.on("error",function(e){
+    if(e.type==="unavailable-id")asClient();
+    else if(e.type==="network"||e.type==="server-error"||e.type==="socket-error"||e.type==="socket-closed"){say("Sin conexión con el servidor de enlace.",true);again()}
+  });
+}
+function asClient(){
+  reset();
+  var p=new Peer();
+  peer=p;
+  p.on("open",function(id){
+    myId=id;
+    var c=p.connect(base+"-hub",{reliable:true});
+    up=c;
+    c.on("open",function(){dot(true);refresh()});
+    c.on("data",function(d){onData(d,null)});
+    c.on("close",again);
+    c.on("error",again);
+  });
+  p.on("call",onCall);
+  p.on("error",function(e){if(e.type!=="disconnected")again()});
+}
+
+/* ---------- pulsar para hablar ---------- */
+function startTalk(){
+  if(talking||!track)return;
+  talking=true;$("#ptt").classList.add("hot");tone(900,1300,90);refresh();
+  clearTimeout(enableT);
+  enableT=setTimeout(function(){if(talking){track.enabled=true;sendS(true)}},140);
+  timer=setTimeout(stopTalk,60000);
+}
+function stopTalk(){
+  if(!talking)return;
+  talking=false;clearTimeout(timer);clearTimeout(enableT);
+  var was=track.enabled;track.enabled=false;
+  $("#ptt").classList.remove("hot");
+  squelch();
+  if(was)sendS(false);
+  refresh();
+}
+
+/* ---------- entrar ---------- */
+async function enter(){
+  myName=($("#name").value||"").trim().slice(0,24)||"Anónimo";
+  var c=($("#chan").value||"equipo").toLowerCase().replace(/[^a-z0-9_-]/g,"-").slice(0,40)||"equipo";
+  base="walkie-"+c;
+  try{localStorage.setItem("walkie",JSON.stringify({name:myName,c:$("#chan").value}))}catch(e){}
+  var AC=window.AudioContext||window.webkitAudioContext;
+  try{ctx=new AC();ctx.resume()}catch(e){ctx=null}
+  $("#login").classList.add("hide");$("#app").classList.remove("hide");$("#cn").textContent=c;
+  if(!window.Peer){say("No se pudo cargar la librería de conexión. Revisa tu internet.",true);return}
+  try{
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)throw new Error("insecure");
+    local=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+    track=local.getAudioTracks()[0];track.enabled=false;
+    $("#ptt").disabled=false;
+  }catch(e){
+    micMsg="Sin acceso al micrófono: solo podrás escuchar. Revisa el permiso del navegador y que la página sea https.";
+    local=ctx?ctx.createMediaStreamDestination().stream:new MediaStream();
+  }
+  refresh();
+  connect();
+}
+
+$("#enter").onclick=enter;
+var ptt=$("#ptt");
+ptt.addEventListener("pointerdown",function(e){e.preventDefault();try{ptt.setPointerCapture(e.pointerId)}catch(x){}startTalk()});
+ptt.addEventListener("pointerup",stopTalk);
+ptt.addEventListener("pointercancel",stopTalk);
+ptt.addEventListener("contextmenu",function(e){e.preventDefault()});
+document.addEventListener("keydown",function(e){if(e.code==="Space"&&!e.repeat&&e.target.tagName!=="INPUT"&&!$("#app").classList.contains("hide")){e.preventDefault();startTalk()}});
+document.addEventListener("keyup",function(e){if(e.code==="Space")stopTalk()});
+document.addEventListener("pointerdown",function(){
+  if(ctx&&ctx.state!=="running")ctx.resume();
+  Object.keys(audios).forEach(function(k){var p=audios[k].play();if(p&&p.catch)p.catch(function(){})});
+},true);
+window.addEventListener("pagehide",function(){left=true;reset()});
+})();
+</script>
+</body>
+</html>
